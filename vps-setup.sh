@@ -197,74 +197,260 @@ node_setup() {
     wget -O /tmp/xray.zip https://github.com/XTLS/Xray-core/releases/download/v26.2.6/Xray-linux-arm64-v8a.zip
   fi
   unzip -qo /tmp/xray.zip -d ./xray-core
-  # Placeholder - will be replaced with panel cert by node_api_setup
+  # Placeholder - will be replaced with panel cert before node containers start
   touch ./ssl_client_cert.pem
   wget -qO- "https://raw.githubusercontent.com/$GIT_REPO/refs/heads/$GIT_BRANCH/templates_for_script/compose-node" | envsubst > ./docker-compose.yml
   wget -qO- "https://raw.githubusercontent.com/$GIT_REPO/refs/heads/$GIT_BRANCH/templates_for_script/angie" | envsubst '$VLESS_DOMAIN' > ./angie.conf
 }
 
-node_api_setup() {
-  echo "Connecting to panel at https://$PANEL_DOMAIN..."
-  TOKEN=$(curl -sf -X POST "https://$PANEL_DOMAIN/api/admin/token" \
+print_response_body() {
+  local response_file="$1"
+  if [[ -s "$response_file" ]]; then
+    cat "$response_file"
+  else
+    echo "(empty response body)"
+  fi
+  if [[ -s "${response_file}.curl.err" ]]; then
+    echo "curl error:"
+    cat "${response_file}.curl.err"
+  fi
+}
+
+require_json_file() {
+  local response_file="$1"
+  local response_name="$2"
+  if [[ ! -s "$response_file" ]]; then
+    echo "$response_name response is empty or missing."
+    return 1
+  fi
+  python3 - "$response_file" << 'PYEOF' >/dev/null 2>&1
+import json, sys
+with open(sys.argv[1]) as fh:
+    json.load(fh)
+PYEOF
+}
+
+curl_json() {
+  local response_file="$1"
+  shift
+  local curl_stderr="${response_file}.curl.err"
+  local http_code="000"
+  local attempt
+
+  : > "$response_file"
+  : > "$curl_stderr"
+
+  for attempt in 1 2 3; do
+    http_code=$(curl -sS --connect-timeout 10 --max-time 30 \
+      -o "$response_file" -w "%{http_code}" "$@" 2>"$curl_stderr") || http_code="000"
+    if [[ "$http_code" != "000" ]]; then
+      echo "$http_code"
+      return 0
+    fi
+    sleep 2
+  done
+
+  echo "000"
+}
+
+node_get_token() {
+  local auth_http
+  auth_http=$(curl_json /tmp/node_auth.json -X POST "https://$PANEL_DOMAIN/api/admin/token" \
     -H "Content-Type: application/x-www-form-urlencoded" \
     --data-urlencode "username=$PANEL_USER" \
-    --data-urlencode "password=$PANEL_PASS" \
-    | yq '.access_token')
+    --data-urlencode "password=$PANEL_PASS")
 
-  if [[ -z "$TOKEN" || "$TOKEN" == "null" ]]; then
-    echo "Failed to authenticate with panel. Check credentials and panel availability."
+  if [[ "$auth_http" != "200" ]]; then
+    echo "Failed to authenticate with panel (HTTP $auth_http):"
+    print_response_body /tmp/node_auth.json
     exit 1
   fi
+  if ! require_json_file /tmp/node_auth.json "Panel auth"; then
+    echo "Panel auth response is not valid JSON."
+    exit 1
+  fi
+
+  TOKEN=$(python3 - << 'PYEOF'
+import json
+with open('/tmp/node_auth.json') as fh:
+    token = json.load(fh).get('access_token')
+if not token:
+    raise SystemExit(1)
+print(token, end='')
+PYEOF
+) || {
+    echo "Panel auth response does not contain access_token. Check Marzban API compatibility."
+    exit 1
+  }
+}
+
+node_fetch_panel_certificate() {
+  echo "Connecting to panel at https://$PANEL_DOMAIN..."
+  node_get_token
 
   echo "Fetching SSL client certificate from panel..."
-  CERT_HTTP=$(curl -s -o /tmp/node_settings.json -w "%{http_code}" \
+  CERT_HTTP=$(curl_json /tmp/node_settings.json \
     "https://$PANEL_DOMAIN/api/node/settings" \
-    -H "Authorization: Bearer $TOKEN" || echo "000")
-  if [[ "$CERT_HTTP" != "200" ]]; then
-    echo "Failed to fetch node settings (HTTP $CERT_HTTP):"
-    cat /tmp/node_settings.json
+    -H "Authorization: Bearer $TOKEN")
+  if [[ "$CERT_HTTP" == "404" ]]; then
+    echo "Panel API /api/node/settings is not available. Check Marzban version compatibility for node certificate distribution."
     exit 1
   fi
-  python3 -c "import json,sys; print(json.load(open('/tmp/node_settings.json'))['certificate'], end='')" \
-    > /opt/xray-vps-setup/ssl_client_cert.pem
+  if [[ "$CERT_HTTP" != "200" ]]; then
+    echo "Failed to fetch node settings (HTTP $CERT_HTTP):"
+    print_response_body /tmp/node_settings.json
+    exit 1
+  fi
+  if ! require_json_file /tmp/node_settings.json "Node settings"; then
+    echo "Node settings response is not valid JSON."
+    exit 1
+  fi
+
+  if ! python3 - << 'PYEOF' > /opt/xray-vps-setup/ssl_client_cert.pem
+import json
+with open('/tmp/node_settings.json') as fh:
+    certificate = json.load(fh).get('certificate')
+if not certificate:
+    raise SystemExit(1)
+print(certificate, end='')
+PYEOF
+  then
+    echo "Node settings response does not contain certificate. Check Marzban API compatibility."
+    exit 1
+  fi
+  if [[ ! -s /opt/xray-vps-setup/ssl_client_cert.pem ]]; then
+    echo "Node certificate file was not created."
+    exit 1
+  fi
+}
+
+wait_for_compose_stack() {
+  local compose_file="/opt/xray-vps-setup/docker-compose.yml"
+  local timeout="${1:-90}"
+  local deadline=$((SECONDS + timeout))
+
+  echo "Waiting for docker compose services to become ready..."
+  while (( SECONDS < deadline )); do
+    local container_ids
+    local container_id
+    local any_container="false"
+    local all_ready="true"
+
+    container_ids=$(docker compose -f "$compose_file" ps -q 2>/dev/null || true)
+    while read -r container_id; do
+      [[ -z "$container_id" ]] && continue
+      any_container="true"
+
+      local state
+      local health
+      state=$(docker inspect -f '{{.State.Status}}' "$container_id" 2>/dev/null || echo "unknown")
+      health=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$container_id" 2>/dev/null || echo "unknown")
+
+      if [[ "$state" != "running" ]]; then
+        all_ready="false"
+        break
+      fi
+      if [[ "$health" != "none" && "$health" != "healthy" ]]; then
+        all_ready="false"
+        break
+      fi
+    done <<< "$container_ids"
+
+    if [[ "$any_container" == "true" && "$all_ready" == "true" ]]; then
+      return 0
+    fi
+
+    sleep 2
+  done
+
+  echo "Docker compose services did not become ready in time."
+  docker compose -f "$compose_file" ps || true
+  return 1
+}
+
+node_api_setup() {
+  node_get_token
 
   NODE_IP=$(hostname -I | awk '{print $1}')
   NODE_NAME=$(hostname)
 
   echo "Creating node '$NODE_NAME' ($NODE_IP) on panel..."
-  NODE_HTTP=$(curl -s -o /tmp/node_response.json -w "%{http_code}" \
+  NODE_HTTP=$(curl_json /tmp/node_response.json \
     -X POST "https://$PANEL_DOMAIN/api/node" \
     -H "Authorization: Bearer $TOKEN" \
     -H "Content-Type: application/json" \
-    -d "{\"name\":\"$NODE_NAME\",\"address\":\"$NODE_IP\",\"port\":62001,\"api_port\":62002,\"add_as_new_host\":false}" || echo "000")
+    -d "{\"name\":\"$NODE_NAME\",\"address\":\"$NODE_IP\",\"port\":62001,\"api_port\":62002,\"add_as_new_host\":false}")
   if [[ "$NODE_HTTP" == "200" ]]; then
-    NODE_ID=$(cat /tmp/node_response.json | yq '.id')
+    if ! require_json_file /tmp/node_response.json "Create node"; then
+      echo "Create node response is not valid JSON."
+      exit 1
+    fi
+    NODE_ID=$(python3 - << 'PYEOF'
+import json
+with open('/tmp/node_response.json') as fh:
+    node_id = json.load(fh).get('id')
+if node_id is None:
+    raise SystemExit(1)
+print(node_id, end='')
+PYEOF
+) || {
+      echo "Create node response does not contain node id."
+      exit 1
+    }
     echo "Node created with ID: $NODE_ID"
   elif [[ "$NODE_HTTP" == "409" ]]; then
     echo "Node already exists on panel, reusing..."
-    NODES_HTTP=$(curl -s -o /tmp/nodes_list.json -w "%{http_code}" \
+    NODES_HTTP=$(curl_json /tmp/nodes_list.json \
       "https://$PANEL_DOMAIN/api/nodes" \
-      -H "Authorization: Bearer $TOKEN" || echo "000")
+      -H "Authorization: Bearer $TOKEN")
     if [[ "$NODES_HTTP" != "200" ]]; then
       echo "Failed to fetch nodes list (HTTP $NODES_HTTP):"
-      cat /tmp/nodes_list.json
+      print_response_body /tmp/nodes_list.json
       exit 1
     fi
-    NODE_ID=$(python3 -c "import json,sys; nodes=json.load(open('/tmp/nodes_list.json')); print(next(str(n['id']) for n in nodes if n['address']=='$NODE_IP'))")
+    if ! require_json_file /tmp/nodes_list.json "Nodes list"; then
+      echo "Nodes list response is not valid JSON."
+      exit 1
+    fi
+    NODE_ID=$(python3 - << PYEOF
+import json
+with open('/tmp/nodes_list.json') as fh:
+    nodes = json.load(fh)
+if isinstance(nodes, dict):
+    nodes = nodes.get('items', [])
+for node in nodes:
+    if node.get('address') == '$NODE_IP' and node.get('name') == '$NODE_NAME':
+        print(node.get('id'), end='')
+        break
+else:
+    raise SystemExit(1)
+PYEOF
+) || {
+      echo "Existing node was not found in /api/nodes response. Check Marzban API compatibility."
+      exit 1
+    }
     echo "Existing node ID: $NODE_ID"
   else
     echo "Failed to create node (HTTP $NODE_HTTP):"
-    cat /tmp/node_response.json
+    print_response_body /tmp/node_response.json
     exit 1
   fi
 
   echo "Updating xray config serverNames with node domain..."
-  CONFIG_HTTP=$(curl -s -o /tmp/xray_config.json -w "%{http_code}" \
+  CONFIG_HTTP=$(curl_json /tmp/xray_config.json \
     "https://$PANEL_DOMAIN/api/core/config" \
-    -H "Authorization: Bearer $TOKEN" || echo "000")
+    -H "Authorization: Bearer $TOKEN")
+  if [[ "$CONFIG_HTTP" == "404" ]]; then
+    echo "Panel API /api/core/config is not available. Check Marzban version compatibility."
+    exit 1
+  fi
   if [[ "$CONFIG_HTTP" != "200" ]]; then
     echo "Failed to fetch xray config (HTTP $CONFIG_HTTP):"
-    cat /tmp/xray_config.json
+    print_response_body /tmp/xray_config.json
+    exit 1
+  fi
+  if ! require_json_file /tmp/xray_config.json "Xray config"; then
+    echo "Xray config response is not valid JSON."
     exit 1
   fi
 
@@ -283,28 +469,49 @@ print(json.dumps(config))
 PYEOF
   python3 /tmp/update_servernames.py > /tmp/xray_config_updated.json \
     || { echo "Failed to process xray config JSON"; exit 1; }
-  curl -s -o /dev/null \
+  CONFIG_UPDATE_HTTP=$(curl_json /tmp/xray_config_put.json \
     -X PUT "https://$PANEL_DOMAIN/api/core/config" \
     -H "Authorization: Bearer $TOKEN" \
     -H "Content-Type: application/json" \
-    -d @/tmp/xray_config_updated.json || true
-  echo "serverNames updated."
+    -d @/tmp/xray_config_updated.json)
+  if [[ "$CONFIG_UPDATE_HTTP" == "200" || "$CONFIG_UPDATE_HTTP" == "204" ]]; then
+    echo "serverNames updated."
+  else
+    echo "Warning: failed to update serverNames (HTTP $CONFIG_UPDATE_HTTP):"
+    print_response_body /tmp/xray_config_put.json
+  fi
 
   echo "Fetching inbounds and current hosts..."
-  INBOUNDS_HTTP=$(curl -s -o /tmp/marzban_inbounds.json -w "%{http_code}" \
+  INBOUNDS_HTTP=$(curl_json /tmp/marzban_inbounds.json \
     "https://$PANEL_DOMAIN/api/inbounds" \
-    -H "Authorization: Bearer $TOKEN" || echo "000")
-  if [[ "$INBOUNDS_HTTP" != "200" ]]; then
-    echo "Failed to fetch inbounds (HTTP $INBOUNDS_HTTP):"
-    cat /tmp/marzban_inbounds.json
+    -H "Authorization: Bearer $TOKEN")
+  if [[ "$INBOUNDS_HTTP" == "404" ]]; then
+    echo "Panel API /api/inbounds is not available. Check Marzban version compatibility."
     exit 1
   fi
-  HOSTS_HTTP=$(curl -s -o /tmp/marzban_hosts.json -w "%{http_code}" \
+  if [[ "$INBOUNDS_HTTP" != "200" ]]; then
+    echo "Failed to fetch inbounds (HTTP $INBOUNDS_HTTP):"
+    print_response_body /tmp/marzban_inbounds.json
+    exit 1
+  fi
+  if ! require_json_file /tmp/marzban_inbounds.json "Inbounds"; then
+    echo "Inbounds response is not valid JSON."
+    exit 1
+  fi
+  HOSTS_HTTP=$(curl_json /tmp/marzban_hosts.json \
     "https://$PANEL_DOMAIN/api/hosts" \
-    -H "Authorization: Bearer $TOKEN" || echo "000")
+    -H "Authorization: Bearer $TOKEN")
+  if [[ "$HOSTS_HTTP" == "404" ]]; then
+    echo "Panel API /api/hosts is not available. Check Marzban version compatibility."
+    exit 1
+  fi
   if [[ "$HOSTS_HTTP" != "200" ]]; then
     echo "Failed to fetch hosts (HTTP $HOSTS_HTTP):"
-    cat /tmp/marzban_hosts.json
+    print_response_body /tmp/marzban_hosts.json
+    exit 1
+  fi
+  if ! require_json_file /tmp/marzban_hosts.json "Hosts"; then
+    echo "Hosts response is not valid JSON."
     exit 1
   fi
 
@@ -316,6 +523,8 @@ with open('/tmp/marzban_hosts.json') as f:
     hosts = json.load(f)
 with open('/tmp/marzban_inbounds.json') as f:
     inbounds = json.load(f)
+if not isinstance(hosts, dict) or not isinstance(inbounds, dict):
+    raise SystemExit(1)
 node_domain = os.environ['NODE_DOMAIN']
 node_name = os.environ['HOST_NODE_NAME']
 panel_user = os.environ['HOST_PANEL_USER']
@@ -330,7 +539,7 @@ for inbound_tag, host_list in hosts.items():
     protocol = info.get('protocol', inbound_tag)
     transport = info.get('network', 'tcp')
     remark = f'{node_name} ({panel_user}) [{protocol} - {transport}]'
-    host_list.append({
+    desired_host = {
         'remark': remark,
         'address': node_domain,
         'port': None,
@@ -347,17 +556,33 @@ for inbound_tag, host_list in hosts.items():
         'noise_setting': None,
         'random_user_agent': None,
         'use_sni_as_host': None,
-    })
+    }
+    existing_host = next(
+        (host for host in host_list
+         if host.get('remark') == remark
+         and host.get('address') == node_domain
+         and host.get('sni') == node_domain),
+        None
+    )
+    if existing_host is None:
+        host_list.append(desired_host)
+    else:
+        existing_host.update(desired_host)
 print(json.dumps(hosts))
 PYEOF
   python3 /tmp/update_hosts.py > /tmp/marzban_hosts_updated.json \
     || { echo "Failed to process hosts JSON"; exit 1; }
-  curl -s -o /dev/null \
+  HOSTS_UPDATE_HTTP=$(curl_json /tmp/marzban_hosts_put.json \
     -X PUT "https://$PANEL_DOMAIN/api/hosts" \
     -H "Authorization: Bearer $TOKEN" \
     -H "Content-Type: application/json" \
-    -d @/tmp/marzban_hosts_updated.json || true
-  echo "Panel hosts updated."
+    -d @/tmp/marzban_hosts_updated.json)
+  if [[ "$HOSTS_UPDATE_HTTP" == "200" || "$HOSTS_UPDATE_HTTP" == "204" ]]; then
+    echo "Panel hosts updated."
+  else
+    echo "Warning: failed to update panel hosts (HTTP $HOSTS_UPDATE_HTTP):"
+    print_response_body /tmp/marzban_hosts_put.json
+  fi
 
   echo "Panel configuration complete!"
 }
@@ -393,12 +618,22 @@ iptables-persistent iptables-persistent/autosave_v6 boolean true
 EOF
 apt-get install iptables-persistent netfilter-persistent -y
 
+ensure_iptables_rule() {
+  if ! iptables -C "$@" 2>/dev/null; then
+    iptables -A "$@"
+  fi
+}
+
 edit_iptables_node() {
   PANEL_IP=$(dig +short $PANEL_DOMAIN | tail -n1)
-  iptables -A INPUT -s $PANEL_IP -p tcp -m tcp --dport 62001 -j ACCEPT
-  iptables -A INPUT -s $PANEL_IP -p tcp -m tcp --dport 62002 -j ACCEPT
-  iptables -A INPUT -p tcp -m tcp --dport 62001 -j REJECT --reject-with tcp-reset
-  iptables -A INPUT -p tcp -m tcp --dport 62002 -j REJECT --reject-with tcp-reset
+  if [[ -z "$PANEL_IP" ]]; then
+    echo "Failed to resolve panel domain $PANEL_DOMAIN for iptables rules."
+    exit 1
+  fi
+  ensure_iptables_rule INPUT -s $PANEL_IP -p tcp -m tcp --dport 62001 -j ACCEPT
+  ensure_iptables_rule INPUT -s $PANEL_IP -p tcp -m tcp --dport 62002 -j ACCEPT
+  ensure_iptables_rule INPUT -p tcp -m tcp --dport 62001 -j REJECT --reject-with tcp-reset
+  ensure_iptables_rule INPUT -p tcp -m tcp --dport 62002 -j REJECT --reject-with tcp-reset
 }
 
 # Configure iptables
@@ -462,10 +697,15 @@ end_script() {
   fi
 
   if [[ "$INSTALL_MODE" == "node" ]]; then
-    node_api_setup
+    node_fetch_panel_certificate
   fi
 
   docker compose -f /opt/xray-vps-setup/docker-compose.yml up -d
+
+  if [[ "$INSTALL_MODE" == "node" ]]; then
+    wait_for_compose_stack
+    node_api_setup
+  fi
 
   if [[ "$INSTALL_MODE" == "marzban" ]]; then
     echo "Waiting for marzban to start..."
